@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+ <meta charset="utf-8" />
+ <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+ <meta name="theme-color" content="#f3f5f7" />
+ <title>Cape Cup Map</title>
+ <style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #f3f5f7; }
+  body { display: grid; place-items: center; padding: clamp(4px, 2vw, 24px); font-family: Arial, sans-serif; }
+  main { width: min(100%, 1700px); }
+  img { display: block; width: 100%; height: auto; max-height: calc(100vh - 2 * clamp(4px, 2vw, 24px));
+    object-fit: contain; background: white; box-shadow: 0 8px 30px rgba(0,0,0,.13); touch-action: pinch-zoom; }
+  @media (max-width: 600px) {
+   body { display: block; padding: 0; }
+   img { min-height: 100svh; max-height: none; box-shadow: none; }
+  }
+ </style>
+</head>
+<body>
+ <main>
+  <img
+   id="cape-cup-map"
+   src="REPLACE_WITH_PUBLIC_R2_MAP_URL"
+   alt="Cape Cup game map"
+  />
+ </main>
+ <script>
+  const displayedMap = document.getElementById("cape-cup-map");
+
+  // Public, read-only Cloudflare R2 URL. Never put R2 write credentials here.
+  const MAP_URL = "REPLACE_WITH_PUBLIC_R2_MAP_URL";
+  const REFRESH_INTERVAL_MS = 2000;
+  const REFRESH_TIMEOUT_MS = 10000;
+
+  let refreshTimer = null;
+  let refreshInProgress = false;
+
+  function refreshMap() {
+   if (document.hidden || refreshInProgress) {
+    return;
+   }
+
+   refreshInProgress = true;
+   const nextImage = new Image();
+   const refreshTimeout = window.setTimeout(() => {
+    nextImage.onload = null;
+    nextImage.onerror = null;
+    refreshInProgress = false;
+   }, REFRESH_TIMEOUT_MS);
+
+   nextImage.onload = () => {
+    window.clearTimeout(refreshTimeout);
+    displayedMap.src = nextImage.src;
+    refreshInProgress = false;
+   };
+
+   nextImage.onerror = () => {
+    // Keep displaying the last successfully loaded map.
+    window.clearTimeout(refreshTimeout);
+    refreshInProgress = false;
+   };
+
+   const separator = MAP_URL.includes("?") ? "&" : "?";
+   nextImage.src = `${MAP_URL}${separator}v=${Date.now()}`;
+  }
+
+  function startRefreshing() {
+   if (refreshTimer !== null || document.hidden) {
+    return;
+   }
+
+   refreshMap();
+   refreshTimer = window.setInterval(refreshMap, REFRESH_INTERVAL_MS);
+  }
+
+  function stopRefreshing() {
+   if (refreshTimer === null) {
+    return;
+   }
+
+   window.clearInterval(refreshTimer);
+   refreshTimer = null;
+  }
+
+  document.addEventListener("visibilitychange", () => {
+   if (document.hidden) {
+    stopRefreshing();
+   } else {
+    startRefreshing();
+   }
+  });
+
+  window.addEventListener("focus", () => {
+   if (!document.hidden) {
+    refreshMap();
+   }
+  });
+
+  startRefreshing();
+ </script>
+</body>
+</html>
