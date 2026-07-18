@@ -1,13 +1,13 @@
 # Cape Cup Map Editor and GitHub Pages Site
 
-The local Python editor creates the final view-only `map.svg`, saves the editable project copy, and publishes only `map.svg` to Cloudflare R2. The GitHub Pages site displays the public R2 object and checks for updates about every two seconds, so later map changes do not require another Git commit or Pages deployment.
+The Python editor creates both SVG versions in memory and publishes `map.svg` and `editable-map.svg` directly to Cloudflare R2. It does not create a local map folder or ZIP. The GitHub Pages site displays the public `map.svg` object and checks for updates about every two seconds, so later map changes do not require another Git commit or Pages deployment.
 
 ## Files
 
 - `map_editor.py` — local editor and R2 publisher.
-- `Cape Cup Map - Editor Source.svg` — initial editable map.
-- `editable-map.svg` — editable project copy; this is never uploaded to R2.
-- `map.svg` — local published copy retained for backup; the website loads the R2 copy.
+- `Cape Cup Map - Editor Source.svg` — local starting template used before a cloud editable map exists.
+- `map.svg` — fixed R2 object shown on the website.
+- `editable-map.svg` — fixed R2 object loaded by the editor for future changes.
 - `index.html` — static GitHub Pages page.
 - `requirements.txt` — Python dependency list.
 - `.env.example` — required setting names without credentials.
@@ -52,7 +52,7 @@ python3 -m pip install -r requirements.txt
 
 Start the editor, open **R2 publishing settings** in the left panel, enter all five values, and click **Save R2 settings**. The editor stores them in a local `.env` file beside `map_editor.py` and loads that file automatically the next time it starts.
 
-The access key and secret fields are blank after saving. Leave them blank to keep the saved credentials, or enter new values to replace them. The `.env` file is ignored by Git and is not included in the exported website folder or ZIP.
+The access key and secret fields are blank after saving. Leave them blank to keep the saved credentials, or enter new values to replace them. The `.env` file is ignored by Git. It is the only file the editor writes locally and contains configuration, not map data.
 
 The editor requires these five settings:
 
@@ -130,19 +130,19 @@ python3 map_editor.py
 
 Then:
 
-1. To continue earlier work, click **Open previous map** and select `editable-map.svg` from the latest project folder.
+1. To continue earlier work, click **Open cloud editable map**. The editor downloads `editable-map.svg` from R2 into memory.
 2. Edit region colors and text.
-3. Click **Publish map & export folder** once.
-4. Wait for the success message. Success is shown only after R2 confirms the upload.
+3. Click **Publish both maps to R2** once.
+4. Wait for the success message. Success is shown only after both uploads finish.
 
-The publish action atomically writes the complete local `map.svg`, writes `editable-map.svg`, and then uploads only the published `map.svg` to the fixed R2 key `map.svg` with:
+The publish action uploads the editable version first and the public version last, using the fixed R2 keys `editable-map.svg` and `map.svg`. Both objects use:
 
 ```text
 Content-Type: image/svg+xml
 Cache-Control: no-cache, max-age=0, must-revalidate
 ```
 
-If configuration, authentication, internet access, or R2 fails, the editor reports the error and keeps the completed local files. Repeated clicks cannot start overlapping publishes.
+The map SVGs are never written to a project folder or ZIP. If configuration, authentication, internet access, or R2 fails, the editor reports the error and keeps the current map open in memory. Repeated clicks cannot start overlapping R2 transfers. If `editable-map.svg` has not been published yet, **Open cloud editable map** reports that error and leaves the current map unchanged.
 
 ## 6. Verify updates without a Git commit
 

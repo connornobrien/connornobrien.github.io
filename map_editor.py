@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Local editor and clean GitHub Pages project exporter for the Cape Cup map.
+"""Local editor and Cloudflare R2 publisher for the Cape Cup map.
 
-The editor binds to localhost, opens in the default browser, writes a complete
-view-only SVG locally, and publishes that SVG to Cloudflare R2 with boto3.
+The editor binds to localhost, opens in the default browser, and publishes both
+the view-only and editable SVG versions directly to Cloudflare R2 with boto3.
 """
 
 from __future__ import annotations
@@ -12,11 +12,9 @@ import html
 import json
 import os
 import re
-import shutil
 import tempfile
 import threading
 import webbrowser
-import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,11 +24,10 @@ from xml.etree import ElementTree as ET
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_SOURCE = APP_DIR / "Cape Cup Map - Editor Source.svg"
-DEFAULT_SITE_DIR = APP_DIR / "Cape Cup Map Project"
-DEFAULT_SITE_ZIP = APP_DIR / "Cape Cup Map Project.zip"
 LOCAL_ENV_PATH = APP_DIR / ".env"
 MAX_REQUEST_BYTES = 2_000_000
 PUBLISHED_MAP_OBJECT_KEY = "map.svg"
+EDITABLE_MAP_OBJECT_KEY = "editable-map.svg"
 PUBLISHED_MAP_CACHE_CONTROL = "no-cache, max-age=0, must-revalidate"
 R2_ENVIRONMENT_VARIABLES = (
     "R2_ENDPOINT_URL",
@@ -143,21 +140,12 @@ def save_local_r2_settings(settings: dict[str, str], path: Path = LOCAL_ENV_PATH
         os.environ[name] = value
 
 
-def upload_published_map(svg_path: str | Path) -> str:
-    """Upload a complete published SVG to the fixed R2 object key ``map.svg``.
-
-    Returns the public URL after the upload completes. Failures are recoverable:
-    the local SVG remains untouched and the caller can display the error.
-    """
-    path = Path(svg_path).resolve()
-    if not path.is_file():
-        raise PublishError(f"Published map was not found: {path}")
-    if path.stat().st_size == 0:
-        raise PublishError(f"Published map is empty and was not uploaded: {path}")
+def _run_r2_operation(action: str, operation):
+    """Run one non-overlapping R2 operation and translate failures for the UI."""
     settings = r2_settings()
 
     if not _R2_UPLOAD_LOCK.acquire(blocking=False):
-        raise PublishInProgressError("A map upload is already in progress. Please wait for it to finish.")
+        raise PublishInProgressError("Another R2 transfer is in progress. Please wait for it to finish.")
     try:
         try:
             import boto3
@@ -175,50 +163,90 @@ def upload_published_map(svg_path: str | Path) -> str:
                 aws_secret_access_key=settings["R2_SECRET_ACCESS_KEY"],
                 region_name="auto",
             )
-            client.upload_file(
-                str(path),
-                settings["R2_BUCKET_NAME"],
-                PUBLISHED_MAP_OBJECT_KEY,
-                ExtraArgs={
-                    "ContentType": "image/svg+xml",
-                    "CacheControl": PUBLISHED_MAP_CACHE_CONTROL,
-                },
-            )
+            return operation(client, settings)
         except EndpointConnectionError as exc:
             raise PublishError(
-                "Could not reach Cloudflare R2. Check the internet connection and R2_ENDPOINT_URL; "
-                "the local map.svg was preserved."
+                f"Could not reach Cloudflare R2 while {action}. Check the internet connection "
+                "and R2_ENDPOINT_URL."
             ) from exc
         except ClientError as exc:
             error = exc.response.get("Error", {})
             code = error.get("Code", "unknown error")
             raise PublishError(
-                f"Cloudflare R2 rejected the upload ({code}). Check the access key, secret, bucket name, "
-                "and bucket-scoped token permissions; the local map.svg was preserved."
+                f"Cloudflare R2 rejected the request ({code}). Check the access key, secret, bucket name, "
+                "and bucket-scoped token permissions."
             ) from exc
         except BotoCoreError as exc:
-            raise PublishError(
-                f"Cloudflare R2 upload failed ({type(exc).__name__}). The local map.svg was preserved."
-            ) from exc
+            raise PublishError(f"Cloudflare R2 {action} failed ({type(exc).__name__}).") from exc
         except ValueError as exc:
-            raise PublishError(
-                f"R2 client configuration is invalid: {exc}. The local map.svg was preserved."
-            ) from exc
-        except OSError as exc:
-            raise PublishError(
-                f"Could not read the local map during upload: {exc}. The local map.svg was preserved."
-            ) from exc
+            raise PublishError(f"R2 client configuration is invalid: {exc}.") from exc
+        except PublishError:
+            raise
         except Exception as exc:
-            # boto3's managed transfer layer can wrap service/authentication
-            # errors in S3UploadFailedError rather than ClientError.
             raise PublishError(
-                f"Cloudflare R2 upload failed ({type(exc).__name__}). Check credentials, bucket "
-                "permissions, and internet access; the local map.svg was preserved."
+                f"Cloudflare R2 {action} failed ({type(exc).__name__}). Check credentials, bucket "
+                "permissions, and internet access."
             ) from exc
     finally:
         _R2_UPLOAD_LOCK.release()
 
-    return settings["R2_PUBLIC_MAP_URL"]
+
+def _upload_svg_objects(objects: dict[str, str]) -> str:
+    for object_key, svg in objects.items():
+        if not isinstance(svg, str) or not svg.strip():
+            raise PublishError(f"{object_key} is empty and was not uploaded.")
+
+    def upload(client, settings: dict[str, str]) -> str:
+        # Upload the editable copy first. Publishing map.svg last means the
+        # website changes only after the matching editable version is stored.
+        for object_key, svg in objects.items():
+            client.put_object(
+                Bucket=settings["R2_BUCKET_NAME"],
+                Key=object_key,
+                Body=svg.encode("utf-8"),
+                ContentType="image/svg+xml",
+                CacheControl=PUBLISHED_MAP_CACHE_CONTROL,
+            )
+        return settings["R2_PUBLIC_MAP_URL"]
+
+    return _run_r2_operation("uploading the map", upload)
+
+
+def upload_map_versions(published_svg: str, editable: str) -> str:
+    """Upload both SVG versions directly from memory, with map.svg last."""
+    return _upload_svg_objects(
+        {
+            EDITABLE_MAP_OBJECT_KEY: editable,
+            PUBLISHED_MAP_OBJECT_KEY: published_svg,
+        }
+    )
+
+
+def upload_published_map(svg_path: str | Path) -> str:
+    """Backward-compatible helper for uploading only an existing map.svg."""
+    path = Path(svg_path).resolve()
+    if not path.is_file():
+        raise PublishError(f"Published map was not found: {path}")
+    return _upload_svg_objects({PUBLISHED_MAP_OBJECT_KEY: path.read_text(encoding="utf-8")})
+
+
+def download_editable_map() -> str:
+    """Load editable-map.svg from R2 without creating a local copy."""
+    def download(client, settings: dict[str, str]) -> str:
+        response = client.get_object(
+            Bucket=settings["R2_BUCKET_NAME"],
+            Key=EDITABLE_MAP_OBJECT_KEY,
+        )
+        body = response["Body"]
+        try:
+            content = body.read(MAX_REQUEST_BYTES + 1)
+        finally:
+            body.close()
+        if len(content) > MAX_REQUEST_BYTES:
+            raise PublishError("The cloud editable-map.svg is too large for the editor.")
+        return content.decode("utf-8")
+
+    return _run_r2_operation("loading editable-map.svg", download)
 
 
 def strip_embedded_scripts(svg: str) -> str:
@@ -592,7 +620,7 @@ def build_editor_html(source_svg: str) -> str:
   .status {{ margin-left: auto; color: #4b5563; font-size: 14px; }}
   button {{ border: 0; border-radius: 8px; padding: 10px 14px; font-weight: 750; cursor: pointer; }}
   #export-project {{ background: #1f5fd1; color: white; }}
-  #import-svg {{ background: #dbe8ff; color: #153b7a; }}
+  #load-cloud-editable {{ background: #dbe8ff; color: #153b7a; }}
   #reset {{ background: #e5e9ef; color: #202833; }}
   .layout {{ display: grid; grid-template-columns: 300px minmax(0,1fr); gap: 16px; padding: 16px; }}
   aside {{ align-self: start; position: sticky; top: 82px; padding: 16px; background: white;
@@ -625,9 +653,8 @@ def build_editor_html(source_svg: str) -> str:
 <body>
  <header>
   <h1>Cape Cup Map Editor</h1>
-  <input id="import-file" type="file" accept="image/svg+xml,.svg" hidden />
-  <button id="import-svg" type="button">Open previous map</button>
-  <button id="export-project" type="button">Publish map &amp; export folder</button>
+  <button id="load-cloud-editable" type="button">Open cloud editable map</button>
+  <button id="export-project" type="button">Publish both maps to R2</button>
   <button id="reset" type="button">Reset</button>
   <div id="status" class="status" role="status">Ready</div>
  </header>
@@ -635,13 +662,13 @@ def build_editor_html(source_svg: str) -> str:
   <aside>
    <h2>How to edit</h2>
    <ol>
-    <li>Open the <code>editable-map.svg</code> from your previous project folder.</li>
+    <li>Open your previous <code>editable-map.svg</code> from R2.</li>
     <li>Click regions and type in their white boxes.</li>
-    <li>Publish the final <code>map.svg</code> to R2 and export one clean project folder.</li>
+    <li>Publish both SVG versions directly to R2.</li>
    </ol>
    <div class="swatches">{swatches}</div>
    <div id="selection" class="selection">No region selected</div>
-   <p>The editor keeps <code>index.html</code>, <code>map.svg</code>, and <code>editable-map.svg</code> locally, then uploads only the final <code>map.svg</code> to R2. After the one-time site setup, later publishes need no GitHub upload or commit.</p>
+   <p>Publish uploads <code>editable-map.svg</code> first and <code>map.svg</code> last. Map files are kept in memory and are not written to this computer.</p>
    <details open>
     <summary>R2 publishing settings</summary>
     <div class="r2-settings">
@@ -675,6 +702,7 @@ def build_editor_html(source_svg: str) -> str:
    const status = document.getElementById('status');
    const selection = document.getElementById('selection');
    const exportProjectButton = document.getElementById('export-project');
+   const loadCloudEditableButton = document.getElementById('load-cloud-editable');
    const saveR2SettingsButton = document.getElementById('save-r2-settings');
    const r2SettingsState = document.getElementById('r2-settings-state');
    const regions = [...document.querySelectorAll('.clickable-region')];
@@ -714,27 +742,28 @@ def build_editor_html(source_svg: str) -> str:
     }};
    }}
 
-   async function postAndDownload(endpoint, downloadUrl, action) {{
+   async function publishMaps() {{
     if (publishRequestActive) {{
      return;
     }}
     publishRequestActive = true;
     exportProjectButton.disabled = true;
-    setStatus(`${{action}}…`);
+    loadCloudEditableButton.disabled = true;
+    setStatus('Publishing map.svg and editable-map.svg to R2…');
     try {{
-     const response = await fetch(endpoint, {{
+     const response = await fetch('/publish-maps', {{
       method: 'POST', headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify(currentPayload())
      }});
      const result = await response.json();
-     if (!response.ok) throw new Error(result.error || `${{action}} failed`);
-     setStatus(result.message || `Created: ${{result.filename}}`);
-     window.location.href = downloadUrl;
+     if (!response.ok) throw new Error(result.error || 'Publish failed');
+     setStatus(result.message);
     }} catch (error) {{
      setStatus(error.message, true);
     }} finally {{
      publishRequestActive = false;
      exportProjectButton.disabled = false;
+     loadCloudEditableButton.disabled = false;
     }}
    }}
 
@@ -745,8 +774,28 @@ def build_editor_html(source_svg: str) -> str:
     setStatus('Map reset');
    }});
 
-   exportProjectButton.addEventListener('click', () =>
-    postAndDownload('/export-project', '/download-project', 'Writing map.svg and publishing to R2'));
+   exportProjectButton.addEventListener('click', publishMaps);
+
+   loadCloudEditableButton.addEventListener('click', async () => {{
+    if (publishRequestActive) return;
+    publishRequestActive = true;
+    exportProjectButton.disabled = true;
+    loadCloudEditableButton.disabled = true;
+    setStatus('Loading editable-map.svg from R2…');
+    try {{
+     const response = await fetch('/load-cloud-editable', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: '{{}}'
+     }});
+     const result = await response.json();
+     if (!response.ok) throw new Error(result.error || 'Could not load the cloud editable map');
+     window.location.reload();
+    }} catch (error) {{
+     setStatus(error.message, true);
+     publishRequestActive = false;
+     exportProjectButton.disabled = false;
+     loadCloudEditableButton.disabled = false;
+    }}
+   }});
 
    saveR2SettingsButton.addEventListener('click', async () => {{
     saveR2SettingsButton.disabled = true;
@@ -778,22 +827,6 @@ def build_editor_html(source_svg: str) -> str:
     }}
    }});
 
-   const fileInput = document.getElementById('import-file');
-   document.getElementById('import-svg').addEventListener('click', () => fileInput.click());
-   fileInput.addEventListener('change', async () => {{
-    const file = fileInput.files[0];
-    if (!file) return;
-    setStatus(`Importing ${{file.name}}…`);
-    try {{
-     const response = await fetch('/import-svg', {{
-      method: 'POST', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{svg: await file.text(), filename: file.name}})
-     }});
-     const result = await response.json();
-     if (!response.ok) throw new Error(result.error || 'Import failed');
-     window.location.reload();
-    }} catch (error) {{ setStatus(error.message, true); fileInput.value = ''; }}
-   }});
   }})();
  </script>
 </body>
@@ -805,15 +838,13 @@ class EditorApplication:
     def __init__(self, source_path: Path):
         load_local_r2_settings()
         self.source_path = source_path
-        self.site_dir = DEFAULT_SITE_DIR
-        self.site_zip_path = DEFAULT_SITE_ZIP
         self.source_svg = source_path.read_text(encoding="utf-8")
         validate_editor_svg(self.source_svg)
         self.editor_page = build_editor_html(self.source_svg).encode("utf-8")
         self.lock = threading.Lock()
         self.publish_lock = threading.Lock()
-
-    def import_svg(self, svg: str) -> None:
+    def load_cloud_editable(self) -> None:
+        svg = download_editable_map()
         validate_editor_svg(svg)
         with self.lock:
             self.source_svg = svg
@@ -837,32 +868,19 @@ class EditorApplication:
         with self.lock:
             self.editor_page = build_editor_html(self.source_svg).encode("utf-8")
 
-    def export_github_pages(self, payload: dict[str, object], upload: bool = True) -> str | None:
+    def publish_maps(self, payload: dict[str, object], upload: bool = True) -> str | None:
         if not self.publish_lock.acquire(blocking=False):
             raise PublishInProgressError("A publish is already in progress. Please wait for it to finish.")
         try:
-            editable = editable_svg(self.source_svg, payload)
-            map_svg = static_svg(self.source_svg, payload)
-            index = github_index()
             with self.lock:
-                # Every export is a clean replacement, so stale maps cannot remain.
-                if self.site_dir.exists():
-                    shutil.rmtree(self.site_dir)
-                self.site_dir.mkdir(parents=True, exist_ok=True)
-                published_map_path = self.site_dir / PUBLISHED_MAP_OBJECT_KEY
-                atomic_write_text(published_map_path, map_svg)
-                atomic_write_text(self.site_dir / "index.html", index)
-                atomic_write_text(self.site_dir / "editable-map.svg", editable)
+                source_svg = self.source_svg
+            editable = editable_svg(source_svg, payload)
+            map_svg = static_svg(source_svg, payload)
+            public_url = upload_map_versions(map_svg, editable) if upload else None
+            with self.lock:
                 self.source_svg = editable
                 self.editor_page = build_editor_html(editable).encode("utf-8")
-                with zipfile.ZipFile(self.site_zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                    archive.writestr("index.html", index)
-                    archive.writestr(PUBLISHED_MAP_OBJECT_KEY, map_svg)
-                    archive.writestr("editable-map.svg", editable)
-
-            if upload:
-                return upload_published_map(published_map_path)
-            return None
+            return public_url
         finally:
             self.publish_lock.release()
 
@@ -896,43 +914,36 @@ def make_handler(app: EditorApplication):
             path = urlparse(self.path).path
             if path == "/":
                 self.send_bytes(app.editor_page, "text/html; charset=utf-8")
-            elif path == "/download-project" and app.site_zip_path.exists():
-                self.send_bytes(
-                    app.site_zip_path.read_bytes(),
-                    "application/zip",
-                    app.site_zip_path.name,
-                )
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
-            if path not in {"/export-project", "/import-svg", "/r2-settings"}:
+            if path not in {"/publish-maps", "/load-cloud-editable", "/r2-settings"}:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length <= 0 or length > MAX_REQUEST_BYTES:
-                    raise ValueError("Invalid export request size.")
+                    raise ValueError("Invalid request size.")
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 if not isinstance(payload, dict):
-                    raise ValueError("Invalid export data.")
+                    raise ValueError("Invalid request data.")
                 if path == "/r2-settings":
                     app.save_r2_settings(payload)
                     self.send_json({"ok": True, "message": "R2 settings saved locally. You can publish now."})
-                elif path == "/import-svg":
-                    imported = payload.get("svg")
-                    if not isinstance(imported, str):
-                        raise ValueError("No SVG file was supplied.")
-                    app.import_svg(imported)
-                    self.send_json({"ok": True, "filename": str(payload.get("filename", "imported.svg"))})
+                elif path == "/load-cloud-editable":
+                    app.load_cloud_editable()
+                    self.send_json({"ok": True, "message": "Loaded editable-map.svg from R2."})
                 else:
-                    public_url = app.export_github_pages(payload)
+                    public_url = app.publish_maps(payload)
                     self.send_json(
                         {
                             "ok": True,
-                            "filename": app.site_zip_path.name,
-                            "message": f"Published map.svg to Cloudflare R2: {public_url}",
+                            "message": (
+                                "Published map.svg and editable-map.svg to Cloudflare R2: "
+                                f"{public_url}"
+                            ),
                         }
                     )
             except PublishInProgressError as exc:
@@ -942,17 +953,20 @@ def make_handler(app: EditorApplication):
             except (ValueError, json.JSONDecodeError) as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except OSError as exc:
-                self.send_json({"ok": False, "error": f"Could not write export: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_json(
+                    {"ok": False, "error": f"Could not update the local editor settings: {exc}"},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
     return Handler
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Edit the Cape Cup map and export SVG or GitHub Pages files.")
+    parser = argparse.ArgumentParser(description="Edit the Cape Cup map and publish both SVG versions to R2.")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE, help="SVG source file")
     parser.add_argument("--port", type=int, default=8765, help="Local editor port (default: 8765)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically")
-    parser.add_argument("--check", action="store_true", help="Validate files and create default exports, then exit")
+    parser.add_argument("--check", action="store_true", help="Validate files without uploading, then exit")
     return parser.parse_args()
 
 
@@ -961,8 +975,8 @@ def main() -> int:
     app = EditorApplication(args.source.resolve())
     if args.check:
         default = {"regions": {}, "notes": {}}
-        app.export_github_pages(default, upload=False)
-        print(f"Validated 43 regions and wrote clean project: {app.site_dir}, {app.site_zip_path}")
+        app.publish_maps(default, upload=False)
+        print("Validated 43 regions; no files were written or uploaded.")
         return 0
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
